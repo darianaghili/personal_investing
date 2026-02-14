@@ -1,0 +1,26 @@
+name: Test Rebalance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install project (editable mode)
+        run: pip install -e .
+
+      - name: Run rebalance test
+        run: python -m personal_investing.rebalance --asof 2025-02-15
