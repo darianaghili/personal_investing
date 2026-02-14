@@ -1,0 +1,9 @@
+max_weight: 0.20
+risk_aversion_lambda: 5.0
+max_positions: 10
+top_n: 50
+min_observations: 12
+cache_dir: data/cache
+results_dir: results
+universe_file: ETF_universe.csv
+ff5_cache_file: data/cache/ff5_monthly.parquet
