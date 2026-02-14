@@ -1,0 +1,10 @@
+pandas
+numpy
+yfinance
+pandas_market_calendars
+pandas_datareader
+statsmodels
+cvxpy
+scipy
+pyyaml
+loguru
