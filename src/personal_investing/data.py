@@ -47,15 +47,22 @@ class YFinanceDataProvider(DataProvider):
         series.name = ticker
         return series
 
-    def get_adjusted_close(
-        self, tickers: list[str], start: date, end: date
-    ) -> pd.DataFrame:
-        all_series: list[pd.Series] = []
-        for ticker in tickers:
+   def get_adjusted_close(
+    self, tickers: list[str], start: date, end: date
+) -> pd.DataFrame:
+    all_series: list[pd.Series] = []
+    failed: list[str] = []
+
+    for ticker in tickers:
+        try:
             cached = self._load_cached(ticker)
             need_download = True
+
             if cached is not None and not cached.empty:
-                if cached.index.min().date() <= start and cached.index.max().date() >= end:
+                if (
+                    cached.index.min().date() <= start
+                    and cached.index.max().date() >= end
+                ):
                     need_download = False
                     series = cached
                 else:
@@ -65,24 +72,49 @@ class YFinanceDataProvider(DataProvider):
 
             if need_download:
                 logger.info(f"Downloading data for {ticker}")
-                dl = self._download(ticker, start, end)
+                try:
+                    dl = self._download(ticker, start, end)
+                except Exception as e:
+                    logger.warning(f"Download failed for {ticker}: {e}")
+                    failed.append(ticker)
+                    continue
+
                 if not dl.empty:
                     merged = pd.concat([series, dl]).sort_index()
                     merged = merged[~merged.index.duplicated(keep="last")]
                     self._save_cached(ticker, merged)
                     series = merged
+                else:
+                    logger.warning(f"No data returned for {ticker}")
+                    failed.append(ticker)
+                    continue
 
             if not series.empty:
                 windowed = series.loc[
-                    (series.index.date >= start) & (series.index.date <= end)
+                    (series.index.date >= start)
+                    & (series.index.date <= end)
                 ]
-                windowed.name = ticker
-                all_series.append(windowed)
+                if not windowed.empty:
+                    windowed.name = ticker
+                    all_series.append(windowed)
+                else:
+                    failed.append(ticker)
+            else:
+                failed.append(ticker)
 
-        if not all_series:
-            return pd.DataFrame()
-        prices = pd.concat(all_series, axis=1).sort_index()
-        return prices
+        except Exception as e:
+            logger.warning(f"Unexpected error for {ticker}: {e}")
+            failed.append(ticker)
+            continue
+
+    if failed:
+        logger.warning(f"Skipped {len(failed)} tickers due to download issues.")
+
+    if not all_series:
+        raise ValueError("No valid price data downloaded for any tickers.")
+
+    prices = pd.concat(all_series, axis=1).sort_index()
+    return prices
 
 
 def monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
