@@ -1,186 +1,325 @@
+# personal_investing/data.py
 from __future__ import annotations
 
 import time
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import pandas as pd
-import yfinance as yf
 from loguru import logger
 
+# Optional dependency (recommended)
+try:
+    import yfinance as yf  # type: ignore
+except Exception:  # pragma: no cover
+    yf = None
 
-CACHE_DIR = Path("data/cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+DateLike = Union[str, date, datetime, pd.Timestamp]
 
 
-class YFinanceDataProvider:
-    """
-    Robust Yahoo Finance adjusted close downloader with:
-    - Per-ticker parquet caching
-    - Retry logic
-    - Graceful failure handling
-    """
+def _to_date(d: DateLike) -> date:
+    if isinstance(d, pd.Timestamp):
+        return d.date()
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    # assume string
+    return pd.to_datetime(d).date()
 
-    def __init__(self, max_retries: int = 3):
-        self.max_retries = max_retries
 
-    # ---------------------------
-    # Public API
-    # ---------------------------
+def _to_timestamp(d: DateLike) -> pd.Timestamp:
+    if isinstance(d, pd.Timestamp):
+        return d.normalize()
+    if isinstance(d, datetime):
+        return pd.Timestamp(d).normalize()
+    if isinstance(d, date):
+        return pd.Timestamp(d).normalize()
+    return pd.Timestamp(pd.to_datetime(d)).normalize()
 
-    def get_adjusted_close(
-        self, tickers: list[str], start: date, end: date
-    ) -> pd.DataFrame:
-        all_series: list[pd.Series] = []
-        failed: list[str] = []
 
-        for ticker in tickers:
-            ticker = str(ticker).strip().upper()
-            if not ticker:
-                continue
+@dataclass(frozen=True)
+class CacheConfig:
+    cache_dir: Path
+    ttl_days: int = 7  # refresh cached history if older than this
 
-            try:
-                series = self._get_one_ticker(ticker, start, end)
-                if series is None or series.empty:
-                    failed.append(ticker)
-                    continue
 
-                windowed = series.loc[
-                    (series.index.date >= start)
-                    & (series.index.date <= end)
-                ]
+def _default_cache_dir() -> Path:
+    # ~/.cache/personal_investing (Linux/macOS); Windows still works
+    return Path.home() / ".cache" / "personal_investing"
 
-                if windowed.empty:
-                    failed.append(ticker)
-                    continue
 
-                windowed.name = ticker
-                all_series.append(windowed)
+CACHE = CacheConfig(cache_dir=_default_cache_dir(), ttl_days=7)
 
-            except Exception as e:
-                logger.warning(f"Unexpected error for {ticker}: {e}")
-                failed.append(ticker)
-                continue
 
-        if failed:
-            logger.warning(f"Skipped {len(failed)} tickers due to download issues.")
+def _ensure_cache_dir(cache_dir: Path) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-        if not all_series:
-            raise ValueError("No valid price data downloaded for any tickers.")
 
-        prices = pd.concat(all_series, axis=1).sort_index()
-        return prices
+def _sanitize_symbol(symbol: str) -> str:
+    # File-safe, but keep it human-readable
+    return (
+        symbol.strip()
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+        .replace("^", "_")
+    )
 
-    # ---------------------------
-    # Internal helpers
-    # ---------------------------
 
-    def _get_one_ticker(
-        self, ticker: str, start: date, end: date
-    ) -> Optional[pd.Series]:
+def _cache_path(symbol: str, cache_dir: Path) -> Path:
+    return cache_dir / f"{_sanitize_symbol(symbol)}.parquet"
 
-        cached = self._load_cached(ticker)
 
-        if (
-            cached is not None
-            and not cached.empty
-            and cached.index.min().date() <= start
-            and cached.index.max().date() >= end
-        ):
-            return cached
+def _is_cache_fresh(path: Path, ttl_days: int) -> bool:
+    if not path.exists():
+        return False
+    try:
+        age_seconds = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age_seconds <= ttl_days * 24 * 60 * 60
 
-        dl = self._download_with_retries(ticker, start, end)
 
-        if dl is None or dl.empty:
-            return cached
-
-        if cached is not None and not cached.empty:
-            merged = pd.concat([cached, dl]).sort_index()
-            merged = merged[~merged.index.duplicated(keep="last")]
-        else:
-            merged = dl
-
-        self._save_cached(ticker, merged)
-        return merged
-
-    def _download_with_retries(
-        self, ticker: str, start: date, end: date
-    ) -> Optional[pd.Series]:
-
-        delay = 1.0
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                logger.info(f"Downloading data for {ticker} (attempt {attempt})")
-                df = yf.download(
-                    ticker,
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                    progress=False,
-                    auto_adjust=False,
-                    threads=False,
-                )
-
-                if df is None or df.empty:
-                    raise ValueError("Empty download")
-
-                if "Adj Close" in df.columns:
-                    s = df["Adj Close"].dropna()
-                elif "Close" in df.columns:
-                    s = df["Close"].dropna()
-                else:
-                    raise ValueError("No price columns returned")
-
-                s.index = pd.to_datetime(s.index)
-                s.name = ticker
-                return s.astype(float)
-
-            except Exception as e:
-                logger.warning(f"Download failed for {ticker}: {e}")
-                time.sleep(delay)
-                delay *= 2
-
+def _read_cache(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+        if df.empty:
+            return None
+        # normalize index/columns expectations
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.set_index("Date")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        return df
+    except Exception as e:
+        logger.warning(f"Failed reading cache {path}: {e}")
         return None
 
-    # ---------------------------
-    # Cache
-    # ---------------------------
 
-    def _cache_path(self, ticker: str) -> Path:
-        safe = ticker.replace("/", "_")
-        return CACHE_DIR / f"{safe}.parquet"
-
-    def _load_cached(self, ticker: str) -> Optional[pd.Series]:
-        path = self._cache_path(ticker)
-        if not path.exists():
-            return None
-
-        try:
-            df = pd.read_parquet(path)
-            s = df.iloc[:, 0]
-            s.index = pd.to_datetime(s.index)
-            return s.sort_index()
-        except Exception as e:
-            logger.warning(f"Failed to read cache for {ticker}: {e}")
-            return None
-
-    def _save_cached(self, ticker: str, series: pd.Series) -> None:
-        try:
-            df = series.to_frame(name=ticker)
-            df.to_parquet(self._cache_path(ticker))
-        except Exception as e:
-            logger.warning(f"Failed to write cache for {ticker}: {e}")
+def _write_cache(path: Path, df: pd.DataFrame) -> None:
+    try:
+        out = df.copy()
+        if isinstance(out.index, pd.DatetimeIndex):
+            out = out.copy()
+            out.index = out.index.tz_localize(None) if out.index.tz is not None else out.index
+        _ensure_cache_dir(path.parent)
+        out.to_parquet(path)
+    except Exception as e:
+        logger.warning(f"Failed writing cache {path}: {e}")
 
 
-# ---------------------------------
-# Monthly Returns Helper
-# ---------------------------------
+def _download_history_yfinance(symbol: str, start: date, end: date) -> pd.DataFrame:
+    if yf is None:
+        raise RuntimeError(
+            "yfinance is not installed/available. Install it with: pip install yfinance"
+        )
 
-def monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    # yfinance end is exclusive-ish depending on API; add a buffer day
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)
+
+    # auto_adjust=False ensures "Adj Close" exists; actions=True captures splits/divs if needed
+    df = yf.download(
+        tickers=symbol,
+        start=start_ts,
+        end=end_ts,
+        auto_adjust=False,
+        actions=False,
+        progress=False,
+        threads=False,
+    )
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # yfinance sometimes returns a multiindex if tickers is list-like; normalize
+    if isinstance(df.columns, pd.MultiIndex):
+        # Take the first level as field names
+        df.columns = df.columns.get_level_values(-1)
+
+    df = df.copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.sort_index()
+
+    # Standardize columns we care about
+    keep = []
+    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if c in df.columns:
+            keep.append(c)
+    df = df[keep]
+
+    return df
+
+
+def get_price_history(
+    symbol: str,
+    start: DateLike,
+    end: DateLike,
+    *,
+    cache_dir: Optional[Path] = None,
+    ttl_days: Optional[int] = None,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
     """
-    Convert daily prices to monthly returns.
+    Returns daily price history for `symbol` between [start, end] inclusive (best effort).
+    Uses a local parquet cache to reduce repeated downloads.
     """
-    monthly_prices = prices.resample("M").last()
-    returns = monthly_prices.pct_change().dropna(how="all")
-    return returns
+    start_d = _to_date(start)
+    end_d = _to_date(end)
+    if end_d < start_d:
+        raise ValueError(f"end < start: {end_d} < {start_d}")
+
+    cache_dir = cache_dir or CACHE.cache_dir
+    ttl_days = CACHE.ttl_days if ttl_days is None else ttl_days
+
+    path = _cache_path(symbol, cache_dir)
+    cached = _read_cache(path)
+
+    # If cache is fresh and covers requested range, serve it
+    if not force_refresh and cached is not None and _is_cache_fresh(path, ttl_days):
+        # If it contains the requested dates, return slice
+        lo = pd.Timestamp(start_d)
+        hi = pd.Timestamp(end_d)
+        if cached.index.min() <= lo and cached.index.max() >= hi:
+            return cached.loc[lo:hi].copy()
+
+    # Decide download window: if cache exists, only extend missing edges
+    download_start = start_d
+    download_end = end_d
+
+    if cached is not None and not cached.empty and not force_refresh:
+        cached_min = cached.index.min().date()
+        cached_max = cached.index.max().date()
+        # Extend slightly to avoid off-by-one issues around market holidays
+        buffer_days = 5
+        if start_d >= cached_min and end_d <= cached_max:
+            # Cache covers it but stale or freshness failed; re-download small window
+            download_start = max(cached_min, start_d - timedelta(days=buffer_days))
+            download_end = min(cached_max, end_d + timedelta(days=buffer_days))
+        else:
+            # Need to extend beyond cached bounds
+            download_start = min(start_d, cached_min) - timedelta(days=buffer_days)
+            download_end = max(end_d, cached_max) + timedelta(days=buffer_days)
+
+    # Download
+    df_new = pd.DataFrame()
+    try:
+        df_new = _download_history_yfinance(symbol, download_start, download_end)
+    except Exception as e:
+        # Keep the log message format you already have
+        logger.warning(f"Unexpected error for {symbol}: {e}")
+        return pd.DataFrame()
+
+    if df_new.empty:
+        return pd.DataFrame()
+
+    # Merge with cache (if any)
+    if cached is not None and not cached.empty:
+        combined = pd.concat([cached, df_new], axis=0)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    else:
+        combined = df_new
+
+    # Persist combined cache and then slice request range
+    _write_cache(path, combined)
+
+    lo = pd.Timestamp(start_d)
+    hi = pd.Timestamp(end_d)
+    return combined.loc[lo:hi].copy()
+
+
+def get_adjusted_close(
+    symbol: str,
+    asof: DateLike,
+    *,
+    lookback_days: int = 10,
+    cache_dir: Optional[Path] = None,
+    ttl_days: Optional[int] = None,
+    force_refresh: bool = False,
+) -> Optional[float]:
+    """
+    Returns the adjusted close for `symbol` as of `asof`.
+    If `asof` is a non-trading day / missing, walks backward up to `lookback_days`.
+    Returns None if not available.
+    """
+    asof_d = _to_date(asof)
+    start_d = asof_d - timedelta(days=lookback_days)
+    end_d = asof_d
+
+    df = get_price_history(
+        symbol,
+        start_d,
+        end_d,
+        cache_dir=cache_dir,
+        ttl_days=ttl_days,
+        force_refresh=force_refresh,
+    )
+
+    if df.empty:
+        return None
+
+    # Prefer Adj Close, fall back to Close
+    price_col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+    if price_col is None:
+        return None
+
+    # Find last available value on/before asof
+    target = _to_timestamp(asof_d)
+    df2 = df.loc[:target]
+    if df2.empty:
+        return None
+
+    val = df2[price_col].dropna()
+    if val.empty:
+        return None
+
+    return float(val.iloc[-1])
+
+
+def get_adjusted_close_series(
+    symbols: list[str],
+    asof: DateLike,
+    *,
+    lookback_days: int = 10,
+    cache_dir: Optional[Path] = None,
+    ttl_days: Optional[int] = None,
+    force_refresh: bool = False,
+) -> pd.Series:
+    """
+    Convenience: vectorized-ish fetch of adjusted closes for many tickers.
+    Returns a Series indexed by symbol (missing -> NaN).
+    """
+    out: dict[str, float] = {}
+    for s in symbols:
+        try:
+            px = get_adjusted_close(
+                s,
+                asof,
+                lookback_days=lookback_days,
+                cache_dir=cache_dir,
+                ttl_days=ttl_days,
+                force_refresh=force_refresh,
+            )
+            out[s] = float("nan") if px is None else float(px)
+        except Exception as e:
+            logger.warning(f"Unexpected error for {s}: {e}")
+            out[s] = float("nan")
+    return pd.Series(out, name=pd.Timestamp(_to_date(asof)))
+
+
+# Optional: a tiny self-test hook you can run directly
+if __name__ == "__main__":
+    # Example:
+    # python -m personal_investing.data
+    test_symbols = ["SPY", "VTI", ".DJI"]
+    asof = "2025-02-15"
+    s = get_adjusted_close_series(test_symbols, asof)
+    print(s)
